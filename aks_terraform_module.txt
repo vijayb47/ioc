@@ -1,0 +1,516 @@
+## Terraform Module for Private AKS with Istio
+
+### Directory Structure
+
+```
+terraform-aks/
+├── main.tf
+├── variables.tf
+├── outputs.tf
+├── versions.tf
+└── terraform.tfvars.example
+```
+
+---
+
+### `versions.tf`
+
+```hcl
+terraform {
+  required_version = ">= 1.5.0"
+  
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 3.80"
+    }
+    azuread = {
+      source  = "hashicorp/azuread"
+      version = "~> 2.45"
+    }
+  }
+}
+
+provider "azurerm" {
+  features {}
+}
+```
+
+---
+
+### `variables.tf`
+
+```hcl
+variable "resource_group_name" {
+  description = "Name of the resource group"
+  type        = string
+}
+
+variable "location" {
+  description = "Azure region for resources"
+  type        = string
+  default     = "eastus"
+}
+
+variable "cluster_name" {
+  description = "Name of the AKS cluster"
+  type        = string
+}
+
+variable "kubernetes_version" {
+  description = "Kubernetes version"
+  type        = string
+  default     = "1.28"
+}
+
+variable "dns_prefix" {
+  description = "DNS prefix for the cluster"
+  type        = string
+}
+
+variable "vnet_name" {
+  description = "Name of the virtual network"
+  type        = string
+}
+
+variable "vnet_address_space" {
+  description = "Address space for the virtual network"
+  type        = list(string)
+  default     = ["10.0.0.0/16"]
+}
+
+variable "aks_subnet_name" {
+  description = "Name of the AKS subnet"
+  type        = string
+  default     = "aks-subnet"
+}
+
+variable "aks_subnet_address_prefix" {
+  description = "Address prefix for AKS subnet"
+  type        = list(string)
+  default     = ["10.0.1.0/24"]
+}
+
+variable "node_pool_name" {
+  description = "Name of the node pool"
+  type        = string
+  default     = "spotpool"
+}
+
+variable "node_count" {
+  description = "Initial number of nodes"
+  type        = number
+  default     = 1
+}
+
+variable "node_vm_size" {
+  description = "VM size for nodes"
+  type        = string
+  default     = "Standard_D2s_v3"
+}
+
+variable "node_disk_size_gb" {
+  description = "Disk size in GB for nodes"
+  type        = number
+  default     = 30
+}
+
+variable "max_pods" {
+  description = "Maximum number of pods per node"
+  type        = number
+  default     = 30
+}
+
+variable "enable_auto_scaling" {
+  description = "Enable auto-scaling for node pool"
+  type        = bool
+  default     = true
+}
+
+variable "min_count" {
+  description = "Minimum number of nodes for auto-scaling"
+  type        = number
+  default     = 1
+}
+
+variable "max_count" {
+  description = "Maximum number of nodes for auto-scaling"
+  type        = number
+  default     = 3
+}
+
+variable "network_plugin" {
+  description = "Network plugin (azure or kubenet)"
+  type        = string
+  default     = "azure"
+}
+
+variable "network_policy" {
+  description = "Network policy (azure or calico)"
+  type        = string
+  default     = "azure"
+}
+
+variable "service_cidr" {
+  description = "CIDR for Kubernetes services"
+  type        = string
+  default     = "10.1.0.0/16"
+}
+
+variable "dns_service_ip" {
+  description = "IP address for DNS service"
+  type        = string
+  default     = "10.1.0.10"
+}
+
+variable "tags" {
+  description = "Tags to apply to resources"
+  type        = map(string)
+  default     = {}
+}
+```
+
+---
+
+### `main.tf`
+
+```hcl
+# Resource Group
+resource "azurerm_resource_group" "aks" {
+  name     = var.resource_group_name
+  location = var.location
+  tags     = var.tags
+}
+
+# Virtual Network
+resource "azurerm_virtual_network" "aks" {
+  name                = var.vnet_name
+  location            = azurerm_resource_group.aks.location
+  resource_group_name = azurerm_resource_group.aks.name
+  address_space       = var.vnet_address_space
+  tags                = var.tags
+}
+
+# Subnet for AKS
+resource "azurerm_subnet" "aks" {
+  name                 = var.aks_subnet_name
+  resource_group_name  = azurerm_resource_group.aks.name
+  virtual_network_name = azurerm_virtual_network.aks.name
+  address_prefixes     = var.aks_subnet_address_prefix
+}
+
+# User Assigned Managed Identity for AKS
+resource "azurerm_user_assigned_identity" "aks" {
+  name                = "${var.cluster_name}-identity"
+  location            = azurerm_resource_group.aks.location
+  resource_group_name = azurerm_resource_group.aks.name
+  tags                = var.tags
+}
+
+# Role Assignment - Network Contributor for AKS Identity on VNet
+resource "azurerm_role_assignment" "aks_network_contributor" {
+  scope                = azurerm_virtual_network.aks.id
+  role_definition_name = "Network Contributor"
+  principal_id         = azurerm_user_assigned_identity.aks.principal_id
+}
+
+# Private AKS Cluster with Spot VMs and Istio
+resource "azurerm_kubernetes_cluster" "aks" {
+  name                      = var.cluster_name
+  location                  = azurerm_resource_group.aks.location
+  resource_group_name       = azurerm_resource_group.aks.name
+  dns_prefix                = var.dns_prefix
+  kubernetes_version        = var.kubernetes_version
+  private_cluster_enabled   = true
+  sku_tier                  = "Standard"
+  azure_policy_enabled      = false
+  
+  tags = var.tags
+
+  # Default node pool with Spot VMs
+  default_node_pool {
+    name                   = var.node_pool_name
+    node_count             = var.node_count
+    vm_size                = var.node_vm_size
+    os_disk_size_gb        = var.node_disk_size_gb
+    vnet_subnet_id         = azurerm_subnet.aks.id
+    max_pods               = var.max_pods
+    type                   = "VirtualMachineScaleSets"
+    enable_auto_scaling    = var.enable_auto_scaling
+    min_count              = var.enable_auto_scaling ? var.min_count : null
+    max_count              = var.enable_auto_scaling ? var.max_count : null
+    
+    # Enable Spot VMs
+    priority               = "Spot"
+    eviction_policy        = "Delete"
+    spot_max_price         = -1  # Pay up to regular price
+    
+    upgrade_settings {
+      max_surge = "10%"
+    }
+  }
+
+  # Managed Identity
+  identity {
+    type         = "UserAssigned"
+    identity_ids = [azurerm_user_assigned_identity.aks.id]
+  }
+
+  # Network Profile
+  network_profile {
+    network_plugin     = var.network_plugin
+    network_policy     = var.network_policy
+    service_cidr       = var.service_cidr
+    dns_service_ip     = var.dns_service_ip
+    load_balancer_sku  = "standard"
+  }
+
+  # Disable Azure Monitor (Log Analytics)
+  oms_agent {
+    log_analytics_workspace_id = null
+    msi_auth_for_monitoring_enabled = false
+  }
+
+  # Enable RBAC
+  role_based_access_control_enabled = true
+
+  # Azure AD RBAC (optional - comment out if not needed)
+  azure_active_directory_role_based_access_control {
+    managed                = true
+    azure_rbac_enabled     = true
+  }
+
+  # Service Mesh (Istio)
+  service_mesh_profile {
+    mode                             = "Istio"
+    internal_ingress_gateway_enabled = true
+    external_ingress_gateway_enabled = true
+  }
+
+  depends_on = [
+    azurerm_role_assignment.aks_network_contributor
+  ]
+}
+```
+
+---
+
+### `outputs.tf`
+
+```hcl
+output "cluster_id" {
+  description = "The Kubernetes cluster ID"
+  value       = azurerm_kubernetes_cluster.aks.id
+}
+
+output "cluster_name" {
+  description = "The Kubernetes cluster name"
+  value       = azurerm_kubernetes_cluster.aks.name
+}
+
+output "cluster_fqdn" {
+  description = "The FQDN of the Kubernetes cluster"
+  value       = azurerm_kubernetes_cluster.aks.fqdn
+}
+
+output "private_fqdn" {
+  description = "The private FQDN of the Kubernetes cluster"
+  value       = azurerm_kubernetes_cluster.aks.private_fqdn
+}
+
+output "kube_config" {
+  description = "Kubernetes configuration"
+  value       = azurerm_kubernetes_cluster.aks.kube_config_raw
+  sensitive   = true
+}
+
+output "client_certificate" {
+  description = "Client certificate"
+  value       = azurerm_kubernetes_cluster.aks.kube_config[0].client_certificate
+  sensitive   = true
+}
+
+output "host" {
+  description = "Kubernetes host"
+  value       = azurerm_kubernetes_cluster.aks.kube_config[0].host
+  sensitive   = true
+}
+
+output "identity_principal_id" {
+  description = "Principal ID of the managed identity"
+  value       = azurerm_user_assigned_identity.aks.principal_id
+}
+
+output "identity_client_id" {
+  description = "Client ID of the managed identity"
+  value       = azurerm_user_assigned_identity.aks.client_id
+}
+
+output "vnet_id" {
+  description = "Virtual Network ID"
+  value       = azurerm_virtual_network.aks.id
+}
+
+output "subnet_id" {
+  description = "AKS Subnet ID"
+  value       = azurerm_subnet.aks.id
+}
+
+output "resource_group_name" {
+  description = "Resource group name"
+  value       = azurerm_resource_group.aks.name
+}
+
+output "istio_enabled" {
+  description = "Whether Istio is enabled"
+  value       = true
+}
+```
+
+---
+
+### `terraform.tfvars.example`
+
+```hcl
+# Copy this file to terraform.tfvars and update with your values
+
+resource_group_name = "rg-aks-private"
+location            = "eastus"
+cluster_name        = "aks-private-cluster"
+dns_prefix          = "aksprivate"
+kubernetes_version  = "1.28"
+
+# Networking
+vnet_name                 = "vnet-aks"
+vnet_address_space        = ["10.0.0.0/16"]
+aks_subnet_name           = "snet-aks"
+aks_subnet_address_prefix = ["10.0.1.0/24"]
+
+# Kubernetes Network
+network_plugin  = "azure"
+network_policy  = "azure"
+service_cidr    = "10.1.0.0/16"
+dns_service_ip  = "10.1.0.10"
+
+# Node Pool Configuration
+node_pool_name     = "spotpool"
+node_count         = 1
+node_vm_size       = "Standard_D2s_v3"
+node_disk_size_gb  = 30
+max_pods           = 30
+
+# Auto-scaling
+enable_auto_scaling = true
+min_count           = 1
+max_count           = 3
+
+# Tags
+tags = {
+  Environment = "Development"
+  ManagedBy   = "Terraform"
+  Project     = "AKS-Private"
+}
+```
+
+---
+
+## Usage Instructions
+
+### 1. Prerequisites
+
+```bash
+# Install Azure CLI
+az login
+
+# Install Terraform
+# Download from https://www.terraform.io/downloads
+```
+
+### 2. Initialize and Deploy
+
+```bash
+# Copy and edit variables
+cp terraform.tfvars.example terraform.tfvars
+# Edit terraform.tfvars with your values
+
+# Initialize Terraform
+terraform init
+
+# Plan the deployment
+terraform plan
+
+# Apply the configuration
+terraform apply
+```
+
+### 3. Get Credentials
+
+```bash
+# Get AKS credentials
+az aks get-credentials \
+  --resource-group rg-aks-private \
+  --name aks-private-cluster
+
+# Verify connection
+kubectl get nodes
+```
+
+### 4. Verify Istio Installation
+
+```bash
+# Check Istio components
+kubectl get pods -n aks-istio-system
+
+# Check Istio ingress gateways
+kubectl get svc -n aks-istio-ingress
+```
+
+---
+
+## Key Features
+
+✅ **Private Cluster**: API server not exposed to internet  
+✅ **Spot VMs**: Cost-effective with automatic eviction handling  
+✅ **Managed Identity**: No password/certificate management  
+✅ **No Log Analytics**: Disabled to reduce costs  
+✅ **RBAC Enabled**: Azure AD integration for access control  
+✅ **Istio Service Mesh**: Built-in with internal and external ingress  
+✅ **Auto-scaling**: Node pool scales between min and max count  
+✅ **Azure CNI**: Advanced networking with Azure Network Policy  
+
+---
+
+## Important Notes
+
+1. **Private Cluster Access**: You'll need a VM/Bastion in the same VNet or VPN/ExpressRoute to access the cluster
+
+2. **Spot VM Considerations**:
+   - Nodes can be evicted with 30-second notice
+   - Use for stateless workloads
+   - Set `spot_max_price = -1` to pay up to regular price (prevents eviction due to price)
+
+3. **Istio Configuration**:
+   - Istio is deployed in `aks-istio-system` namespace
+   - Ingress gateways in `aks-istio-ingress` namespace
+   - Use Istio CRDs for traffic management
+
+4. **Cost Optimization**:
+   - Spot VMs can save up to 90% compared to regular VMs
+   - No Log Analytics reduces monthly costs
+   - Single node pool for simplicity
+
+5. **Accessing Private Cluster**:
+```bash
+# Create a VM in the same VNet for access
+# Or use Azure Bastion
+# Or configure VPN/ExpressRoute
+```
+
+---
+
+## Clean Up
+
+```bash
+# Destroy all resources
+terraform destroy
+```
